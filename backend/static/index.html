@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speech to Text</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#6b7280; --accent:#2563eb; --danger:#dc2626; --line:#e5e7eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:16px 24px; background:var(--card); border-bottom:1px solid var(--line); font-weight:600; }
+  main { max-width:980px; margin:24px auto; padding:0 16px; display:grid; gap:24px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; }
+  h2 { margin:0 0 12px; font-size:18px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .between { justify-content:space-between; }
+  button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:#fff; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.rec { background:var(--danger); color:#fff; border-color:var(--danger); }
+  button.danger { color:var(--danger); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  select, input, textarea { font:inherit; padding:8px; border:1px solid var(--line); border-radius:8px; }
+  textarea { width:100%; min-height:120px; resize:vertical; margin-top:12px; }
+  #live { min-height:24px; color:var(--muted); font-style:italic; margin:8px 0 0; }
+  .status { color:var(--muted); font-size:14px; }
+  .muted { color:var(--muted); }
+  .hint { color:var(--muted); font-size:13px; margin:8px 0 0; }
+  .warn { background:#fef3c7; padding:10px; border-radius:8px; display:none; margin-bottom:12px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; margin-top:12px; }
+  th, td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  td.text { white-space:pre-wrap; word-break:break-word; max-width:520px; }
+  td input { width:160px; }
+</style>
+</head>
+<body>
+<header>Speech to Text</header>
+<main>
+
+<section>
+  <h2>Live transcription</h2>
+  <div class="warn" id="unsupported">
+    This browser does not support the Web Speech API. Use Google Chrome or Microsoft Edge.
+  </div>
+  <div class="row">
+    <label>Language
+      <select id="lang">
+        <option value="hi-IN" selected>Hindi (India), best for Hinglish</option>
+        <option value="en-IN">English (India)</option>
+        <option value="en-US">English (US)</option>
+      </select>
+    </label>
+    <button id="toggle" class="rec">Start recording</button>
+    <button id="speak">Read back</button>
+    <button id="clear">Clear</button>
+    <span class="status" id="status">Idle</span>
+  </div>
+  <p class="hint">
+    Speak in one language at a time. Hinglish works best with Hindi selected, but the browser
+    engine may write English words in Devanagari or mis-hear them. Edit the text before saving.
+  </p>
+  <p id="live"></p>
+  <textarea id="transcript" placeholder="Your transcription appears here. You can edit it before saving."></textarea>
+  <div class="row" style="margin-top:12px">
+    <button id="save" class="primary">Save transcription</button>
+  </div>
+</section>
+
+<section>
+  <div class="row between">
+    <h2 style="margin:0">History</h2>
+    <div class="row">
+      <input id="search" placeholder="Search text or language">
+      <button id="refresh">Refresh</button>
+    </div>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Created</th><th>Language</th><th>Text</th><th></th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="row" style="margin-top:12px">
+    <button id="prev">Previous</button>
+    <button id="next">Next</button>
+    <span class="status" id="page"></span>
+  </div>
+</section>
+
+</main>
+
+<script>
+const PAGE_SIZE = 20;
+const $ = (id) => document.getElementById(id);
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+let recognition = null;
+let recording = false;
+let fatalError = false;
+let offset = 0;
+let searchTimer = null;
+
+function setStatus(msg) {
+  $("status").textContent = msg;
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  if (res.status === 204) return null;
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = Array.isArray(body.detail)
+      ? body.detail.map((d) => d.msg).join("; ")
+      : body.detail;
+    throw new Error(detail || `Request failed (${res.status})`);
+  }
+  return body;
+}
+
+// ---------- Live transcription (browser Web Speech API) ----------
+
+function setRecording(on) {
+  recording = on;
+  $("toggle").textContent = on ? "Stop recording" : "Start recording";
+  $("lang").disabled = on;
+}
+
+function appendText(text) {
+  if (!text) return;
+  const area = $("transcript");
+  const sep = area.value && !/\s$/.test(area.value) ? " " : "";
+  area.value += sep + text;
+}
+
+function startRecording() {
+  if (!SR) return;
+  recognition = new SR();
+  recognition.lang = $("lang").value;
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  fatalError = false;
+
+  recognition.onresult = (event) => {
+    let interim = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      if (result.isFinal) appendText(result[0].transcript.trim());
+      else interim += result[0].transcript;
+    }
+    $("live").textContent = interim;
+  };
+
+  recognition.onerror = (event) => {
+    if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+      fatalError = true;
+      setStatus("Microphone permission denied. Allow mic access and try again.");
+    } else if (event.error !== "no-speech" && event.error !== "aborted") {
+      setStatus("Recognition error: " + event.error);
+    }
+  };
+
+  recognition.onend = () => {
+    // Chrome ends sessions after silence; restart while the user still wants to record.
+    if (recording && !fatalError) {
+      try {
+        recognition.start();
+        return;
+      } catch (_) {
+        /* fall through and stop */
+      }
+    }
+    setRecording(false);
+    $("live").textContent = "";
+    if (!fatalError) setStatus("Stopped");
+  };
+
+  try {
+    recognition.start();
+    setRecording(true);
+    setStatus("Listening…");
+  } catch (e) {
+    setStatus("Could not start microphone: " + e.message);
+  }
+}
+
+function stopRecording() {
+  recording = false;
+  if (recognition) recognition.stop();
+  setRecording(false);
+  $("live").textContent = "";
+  setStatus("Stopped");
+}
+
+$("toggle").addEventListener("click", () => (recording ? stopRecording() : startRecording()));
+
+$("speak").addEventListener("click", () => {
+  const text = $("transcript").value.trim();
+  if (!text || !("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = $("lang").value;
+  speechSynthesis.speak(utterance);
+});
+
+$("clear").addEventListener("click", () => {
+  $("transcript").value = "";
+  $("live").textContent = "";
+});
+
+$("save").addEventListener("click", async () => {
+  const text = $("transcript").value.trim();
+  if (!text) {
+    setStatus("Nothing to save");
+    return;
+  }
+  if (recording) stopRecording();
+  try {
+    await api("/api/transcriptions", {
+      method: "POST",
+      body: JSON.stringify({ text, language: $("lang").value }),
+    });
+    $("transcript").value = "";
+    setStatus("Saved");
+    offset = 0;
+    loadHistory();
+  } catch (e) {
+    setStatus("Save failed: " + e.message);
+  }
+});
+
+if (!SR) {
+  $("unsupported").style.display = "block";
+  $("toggle").disabled = true;
+}
+if (!("speechSynthesis" in window)) $("speak").disabled = true;
+
+// ---------- History dashboard (CRUD) ----------
+
+function mkButton(label, onClick, className = "") {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = label;
+  if (className) b.className = className;
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+function cell(text, className = "") {
+  const td = document.createElement("td");
+  if (className) td.className = className;
+  td.textContent = text;
+  return td;
+}
+
+function renderRow(item) {
+  const tr = document.createElement("tr");
+  tr.append(
+    cell(new Date(item.created_at).toLocaleString(), "muted"),
+    cell(item.language),
+    cell(item.text, "text")
+  );
+  const actions = document.createElement("td");
+  actions.append(
+    mkButton("Edit", () => editRow(tr, item)),
+    " ",
+    mkButton("Delete", () => deleteItem(item), "danger")
+  );
+  tr.append(actions);
+  return tr;
+}
+
+function renderRows(items) {
+  const tbody = $("rows");
+  tbody.replaceChildren();
+  if (!items.length) {
+    const tr = document.createElement("tr");
+    const td = cell("No transcriptions yet.", "muted");
+    td.colSpan = 4;
+    tr.append(td);
+    tbody.append(tr);
+    return;
+  }
+  for (const item of items) tbody.append(renderRow(item));
+}
+
+async function loadHistory() {
+  const params = new URLSearchParams({ limit: PAGE_SIZE, offset });
+  const q = $("search").value.trim();
+  if (q) params.set("q", q);
+  try {
+    const items = await api("/api/transcriptions?" + params.toString());
+    if (!items.length && offset > 0) {
+      offset = Math.max(0, offset - PAGE_SIZE);
+      return loadHistory();
+    }
+    renderRows(items);
+    $("prev").disabled = offset === 0;
+    $("next").disabled = items.length < PAGE_SIZE;
+    $("page").textContent = items.length
+      ? `Showing ${offset + 1}–${offset + items.length}`
+      : "";
+  } catch (e) {
+    setStatus("Could not load history: " + e.message);
+  }
+}
+
+function editRow(tr, item) {
+  const td = document.createElement("td");
+  td.colSpan = 4;
+
+  const area = document.createElement("textarea");
+  area.value = item.text;
+
+  const lang = document.createElement("input");
+  lang.value = item.language;
+
+  const save = mkButton(
+    "Save",
+    async () => {
+      try {
+        await api(`/api/transcriptions/${item.id}`, {
+          method: "PUT",
+          body: JSON.stringify({ text: area.value, language: lang.value }),
+        });
+        loadHistory();
+      } catch (e) {
+        setStatus("Update failed: " + e.message);
+      }
+    },
+    "primary"
+  );
+  const cancel = mkButton("Cancel", () => loadHistory());
+
+  td.append(area, document.createElement("br"), lang, " ", save, " ", cancel);
+  tr.replaceChildren(td);
+}
+
+async function deleteItem(item) {
+  if (!confirm("Delete this transcription?")) return;
+  try {
+    await api(`/api/transcriptions/${item.id}`, { method: "DELETE" });
+    loadHistory();
+  } catch (e) {
+    setStatus("Delete failed: " + e.message);
+  }
+}
+
+$("refresh").addEventListener("click", loadHistory);
+$("prev").addEventListener("click", () => {
+  offset = Math.max(0, offset - PAGE_SIZE);
+  loadHistory();
+});
+$("next").addEventListener("click", () => {
+  offset += PAGE_SIZE;
+  loadHistory();
+});
+$("search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    offset = 0;
+    loadHistory();
+  }, 300);
+});
+
+loadHistory();
+</script>
+</body>
+</html>
